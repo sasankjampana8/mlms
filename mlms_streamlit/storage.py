@@ -6,6 +6,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
 # Base directory is the folder where this file lives (mlms_streamlit/)
@@ -467,3 +468,67 @@ def list_deployments(project_id: int) -> List[Dict[str, Any]]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+def delete_project(project_id: int, *, delete_files: bool = True) -> None:
+    """
+    Deletes a project + all related records (datasets, experiments, runs, deployments).
+    Optionally deletes local files under data/project_<id> and artifacts/run_*.
+    """
+    conn = connect()
+    cur = conn.cursor()
+
+    # Collect dataset paths (to optionally delete files)
+    dataset_rows = cur.execute(
+        "SELECT id, file_path FROM datasets WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    dataset_paths = [dict(r)["file_path"] for r in dataset_rows]
+
+    # Collect run model paths
+    run_rows = cur.execute(
+        """
+        SELECT r.id, r.model_path
+        FROM runs r
+        JOIN experiments e ON e.id = r.experiment_id
+        WHERE e.project_id = ?
+        """,
+        (project_id,),
+    ).fetchall()
+    model_paths = [dict(r).get("model_path", "") for r in run_rows]
+
+    # Delete DB rows (children first)
+    cur.execute("DELETE FROM deployments WHERE project_id = ?", (project_id,))
+    cur.execute(
+        "DELETE FROM runs WHERE experiment_id IN (SELECT id FROM experiments WHERE project_id = ?)",
+        (project_id,),
+    )
+    cur.execute("DELETE FROM experiments WHERE project_id = ?", (project_id,))
+    cur.execute("DELETE FROM datasets WHERE project_id = ?", (project_id,))
+    cur.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+    conn.commit()
+    conn.close()
+
+    if not delete_files:
+        return
+
+    # Delete dataset files + project folder
+    try:
+        proj_data_dir = Path(DATA_DIR) / f"project_{project_id}"
+        if proj_data_dir.exists():
+            shutil.rmtree(proj_data_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    # Delete model artifacts based on model paths (if present)
+    for mp in model_paths:
+        if not mp:
+            continue
+        try:
+            abs_mp = Path(abs_path(mp))
+            # remove the run directory (…/artifacts/run_<id>/)
+            run_dir = abs_mp.parent
+            if run_dir.exists():
+                shutil.rmtree(run_dir, ignore_errors=True)
+        except Exception:
+            pass

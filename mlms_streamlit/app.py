@@ -1,27 +1,32 @@
 # app.py
 from __future__ import annotations
 
-import json
-import os
 import hashlib
 import io
+import json
+import os
 from typing import Any, Dict
 
 import pandas as pd
 import streamlit as st
 
 import storage
-from trainer import basic_profile, train_and_evaluate, predict_from_model
-
+from trainer import basic_profile, predict_from_model, train_and_evaluate
 
 st.set_page_config(page_title="ML Management System (POC)", layout="wide")
 storage.init_db()
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
 def _load_df(file_path: str) -> pd.DataFrame:
     abs_fp = storage.abs_path(file_path)
     if not os.path.exists(abs_fp):
-        raise FileNotFoundError(f"CSV missing on disk:\n{abs_fp}\n\nTip: On Streamlit Cloud, upload the dataset again inside the app.")
+        raise FileNotFoundError(
+            f"CSV missing on disk:\n{abs_fp}\n\n"
+            "Tip: On Streamlit Cloud, upload the dataset again inside the app."
+        )
     return pd.read_csv(abs_fp)
 
 
@@ -29,7 +34,11 @@ def _project_selector(projects):
     if not projects:
         return None
     labels = [f'#{p["id"]} — {p["name"]}' for p in projects]
-    idx = st.sidebar.selectbox("Select Project", range(len(projects)), format_func=lambda i: labels[i])
+    idx = st.sidebar.selectbox(
+        "Select Project",
+        range(len(projects)),
+        format_func=lambda i: labels[i],
+    )
     return projects[idx]
 
 
@@ -54,6 +63,21 @@ project = _project_selector(projects)
 if not project:
     st.info("Create a project to get started.")
     st.stop()
+
+# ---- Danger zone: delete project
+st.sidebar.divider()
+st.sidebar.subheader("Danger zone")
+with st.sidebar.expander("🗑️ Delete this project", expanded=False):
+    st.warning("This will delete the project and all experiments/runs/deployments.")
+    delete_files = st.checkbox("Also delete local dataset/model files", value=True)
+    confirm = st.text_input("Type DELETE to confirm", value="")
+    if st.button("Delete Project", type="primary", use_container_width=True):
+        if confirm.strip().upper() != "DELETE":
+            st.error("Confirmation failed. Type DELETE to proceed.")
+        else:
+            storage.delete_project(project["id"], delete_files=delete_files)
+            st.success("Project deleted.")
+            st.rerun()
 
 st.title(f'📁 Project: {project["name"]}')
 st.caption(project.get("description", ""))
@@ -119,6 +143,7 @@ with tab_overview:
         )
     else:
         st.info("No successful runs yet. Create an experiment and run training.")
+
 
 # ---------------------------
 # Data
@@ -235,6 +260,7 @@ with tab_data:
             st.markdown("### Quick profile")
             st.json(selected.get("summary", {}))
 
+
 # ---------------------------
 # Experiments
 # ---------------------------
@@ -257,7 +283,6 @@ with tab_experiments:
                 format_func=lambda d: f'#{d["id"]} — {d["name"]} v{d["version"]}',
             )
 
-            # Guard missing file
             if not os.path.exists(storage.abs_path(ds["file_path"])):
                 st.error(
                     "Selected dataset file is missing on disk.\n\n"
@@ -336,6 +361,7 @@ with tab_experiments:
                 )
                 st.dataframe(exp_table, use_container_width=True, hide_index=True)
 
+
 # ---------------------------
 # Runs
 # ---------------------------
@@ -392,7 +418,6 @@ with tab_runs:
                 try:
                     model_dir = os.path.join(storage.ARTIFACTS_DIR, f"run_{run_id}")
                     os.makedirs(model_dir, exist_ok=True)
-
                     model_path = os.path.join(model_dir, "model.joblib")
 
                     metrics, logs = train_and_evaluate(
@@ -405,13 +430,12 @@ with tab_runs:
                         params=params,
                     )
 
-                    # store relative model path in DB
                     storage.update_run(
                         run_id,
                         status="SUCCEEDED",
                         metrics=metrics,
                         logs_text=logs,
-                        model_path=model_path,
+                        model_path=model_path,  # stored relative/portable
                     )
                     st.success(f"Run #{run_id} succeeded.")
                 except Exception as e:
@@ -456,6 +480,7 @@ with tab_runs:
             st.markdown("### Logs")
             st.code(picked_run.get("logs_text") or "", language="text")
 
+
 # ---------------------------
 # Deployments
 # ---------------------------
@@ -479,7 +504,9 @@ with tab_deploy:
             choice = st.selectbox(
                 "Pick a run",
                 options=all_success_runs,
-                format_func=lambda t: f'Run #{t[1]["id"]} — {t[1]["algorithm"]} (Exp #{t[0]["id"]}: {t[0]["name"]})',
+                format_func=lambda t: (
+                    f'Run #{t[1]["id"]} — {t[1]["algorithm"]} (Exp #{t[0]["id"]}: {t[0]["name"]})'
+                ),
             )
             exp, run = choice
 
@@ -501,13 +528,13 @@ with tab_deploy:
             st.markdown("### Test a deployed model (in-app)")
             deps = storage.list_deployments(project["id"])
             if deps:
-                _toggle = st.selectbox(
+                dep = st.selectbox(
                     "Select deployment",
                     options=deps,
                     format_func=lambda d: f'#{d["id"]} — {d["name"]} [{d["status"]}]',
                 )
-                dep = _toggle
                 run_obj = storage.get_run(dep["run_id"])
+
                 if not run_obj or not run_obj.get("model_path"):
                     st.error("Run/model missing for this deployment.")
                 else:
