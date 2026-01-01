@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import io
 from typing import Any, Dict
 
 import pandas as pd
@@ -18,7 +19,10 @@ storage.init_db()
 
 
 def _load_df(file_path: str) -> pd.DataFrame:
-    return pd.read_csv(file_path)
+    abs_fp = storage.abs_path(file_path)
+    if not os.path.exists(abs_fp):
+        raise FileNotFoundError(f"CSV missing on disk:\n{abs_fp}\n\nTip: On Streamlit Cloud, upload the dataset again inside the app.")
+    return pd.read_csv(abs_fp)
 
 
 def _project_selector(projects):
@@ -135,7 +139,7 @@ with tab_data:
         uploaded = st.file_uploader(
             "Upload a CSV file",
             type=["csv"],
-            key=st.session_state.uploader_key,  # important: lets us reset after save
+            key=st.session_state.uploader_key,
         )
 
         if uploaded is None:
@@ -145,8 +149,7 @@ with tab_data:
                 file_bytes = uploaded.getvalue()
                 file_hash = hashlib.md5(file_bytes).hexdigest()
 
-                # Preview without saving
-                df_preview = pd.read_csv(uploaded)
+                df_preview = pd.read_csv(io.BytesIO(file_bytes))
                 st.markdown("#### Preview (first 30 rows)")
                 st.dataframe(df_preview.head(30), use_container_width=True)
 
@@ -154,7 +157,6 @@ with tab_data:
                 summary = basic_profile(df_preview)
                 st.json(summary)
 
-                # Save explicitly
                 if st.button("✅ Save as new dataset version", type="primary", use_container_width=True):
                     if st.session_state.last_saved_file_hash == file_hash:
                         st.warning("This exact file was already saved. Upload a different file to create a new version.")
@@ -164,13 +166,11 @@ with tab_data:
                             project_id=project["id"],
                             name=dataset_name,
                             version=version,
-                            file_path=file_path,
+                            file_path=file_path,  # stored relative
                             summary=summary,
                         )
 
                         st.session_state.last_saved_file_hash = file_hash
-
-                        # Reset uploader so Streamlit doesn't re-trigger save on rerun
                         st.session_state.uploader_key = st.session_state.uploader_key + "_reset"
 
                         st.success(f"Saved dataset #{dataset_id} — {dataset_name} v{version}")
@@ -185,12 +185,14 @@ with tab_data:
             st.info("No datasets yet. Upload a CSV to begin.")
         else:
             st.markdown("### Dataset Versions")
+
             df_list = pd.DataFrame(
                 [
                     {
                         "dataset_id": d["id"],
                         "name": d["name"],
                         "version": d["version"],
+                        "file_exists": os.path.exists(storage.abs_path(d["file_path"])),
                         "rows": (d.get("summary") or {}).get("rows"),
                         "cols": (d.get("summary") or {}).get("cols"),
                         "created_at": d["created_at"],
@@ -200,12 +202,33 @@ with tab_data:
             )
             st.dataframe(df_list, use_container_width=True, hide_index=True)
 
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("🧹 Remove dataset records with missing files", use_container_width=True):
+                    removed = 0
+                    for d in datasets:
+                        if not os.path.exists(storage.abs_path(d["file_path"])):
+                            storage.delete_dataset(d["id"])
+                            removed += 1
+                    st.success(f"Removed {removed} broken dataset record(s).")
+                    st.rerun()
+
             selected = st.selectbox(
                 "Preview dataset",
                 options=datasets,
                 format_func=lambda d: f'#{d["id"]} — {d["name"]} v{d["version"]}',
             )
-            df_prev = _load_df(selected["file_path"])
+
+            try:
+                df_prev = _load_df(selected["file_path"])
+            except FileNotFoundError as e:
+                st.error(str(e))
+                if st.button("🗑️ Delete this broken dataset record", use_container_width=True):
+                    storage.delete_dataset(selected["id"])
+                    st.success("Deleted dataset record.")
+                    st.rerun()
+                st.stop()
+
             st.markdown("### Preview")
             st.dataframe(df_prev.head(50), use_container_width=True)
 
@@ -233,6 +256,14 @@ with tab_experiments:
                 options=datasets,
                 format_func=lambda d: f'#{d["id"]} — {d["name"]} v{d["version"]}',
             )
+
+            # Guard missing file
+            if not os.path.exists(storage.abs_path(ds["file_path"])):
+                st.error(
+                    "Selected dataset file is missing on disk.\n\n"
+                    "Fix: Go to Data tab → remove broken records OR upload the dataset again."
+                )
+                st.stop()
 
             df = _load_df(ds["file_path"])
             cols = df.columns.tolist()
@@ -327,6 +358,13 @@ with tab_runs:
         ds = storage.get_dataset(exp["dataset_id"])
         assert ds is not None
 
+        if not os.path.exists(storage.abs_path(ds["file_path"])):
+            st.error(
+                "Dataset file missing for this experiment.\n\n"
+                "Fix: Go to Data tab → remove broken records OR upload dataset again and create a new experiment."
+            )
+            st.stop()
+
         df = _load_df(ds["file_path"])
 
         st.markdown("### Start a new run")
@@ -353,6 +391,8 @@ with tab_runs:
             with st.spinner("Training in progress..."):
                 try:
                     model_dir = os.path.join(storage.ARTIFACTS_DIR, f"run_{run_id}")
+                    os.makedirs(model_dir, exist_ok=True)
+
                     model_path = os.path.join(model_dir, "model.joblib")
 
                     metrics, logs = train_and_evaluate(
@@ -365,6 +405,7 @@ with tab_runs:
                         params=params,
                     )
 
+                    # store relative model path in DB
                     storage.update_run(
                         run_id,
                         status="SUCCEEDED",
@@ -460,15 +501,24 @@ with tab_deploy:
             st.markdown("### Test a deployed model (in-app)")
             deps = storage.list_deployments(project["id"])
             if deps:
-                dep = st.selectbox(
+                _toggle = st.selectbox(
                     "Select deployment",
                     options=deps,
                     format_func=lambda d: f'#{d["id"]} — {d["name"]} [{d["status"]}]',
                 )
+                dep = _toggle
                 run_obj = storage.get_run(dep["run_id"])
                 if not run_obj or not run_obj.get("model_path"):
                     st.error("Run/model missing for this deployment.")
                 else:
+                    abs_model_path = storage.abs_path(run_obj["model_path"])
+                    if not os.path.exists(abs_model_path):
+                        st.error(
+                            f"Model file missing on disk:\n{abs_model_path}\n\n"
+                            "If you're on Streamlit Cloud, you must train the model inside the deployed app."
+                        )
+                        st.stop()
+
                     input_json = st.text_area(
                         "Input features JSON (one row)",
                         value='{"feature1": 1, "feature2": "A"}',
@@ -477,7 +527,7 @@ with tab_deploy:
                     if st.button("Send Test Request", type="primary"):
                         try:
                             row = json.loads(input_json)
-                            out = predict_from_model(run_obj["model_path"], row)
+                            out = predict_from_model(abs_model_path, row)
                             st.json(out)
                             st.code(
                                 "curl (placeholder):\n"

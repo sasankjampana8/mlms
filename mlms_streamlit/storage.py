@@ -4,14 +4,23 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "mlms.db")
-DATA_DIR = os.path.join(BASE_DIR, "data")
-ARTIFACTS_DIR = os.path.join(BASE_DIR, "artifacts")
+# Base directory is the folder where this file lives (mlms_streamlit/)
+_BASE_DIR = Path(__file__).resolve().parent
+
+# Persist under repo folder (works on local + Streamlit Cloud)
+_DATA_DIR_PATH = _BASE_DIR / "data"
+_ARTIFACTS_DIR_PATH = _BASE_DIR / "artifacts"
+_DB_PATH = _DATA_DIR_PATH / "mlms.db"
+
+# Export strings for backward compatibility with your app code
+BASE_DIR = str(_BASE_DIR)
+DB_PATH = str(_DB_PATH)
+DATA_DIR = str(_DATA_DIR_PATH)
+ARTIFACTS_DIR = str(_ARTIFACTS_DIR_PATH)
 
 
 def _now() -> str:
@@ -19,12 +28,43 @@ def _now() -> str:
 
 
 def ensure_dirs() -> None:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    _DATA_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    _ARTIFACTS_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
+
+def abs_path(path_str: str) -> str:
+    """
+    Convert a stored relative path (e.g., 'data/project_1/x.csv') into an absolute path.
+    If already absolute, returns as-is.
+    """
+    if not path_str:
+        return path_str
+    p = Path(path_str)
+    if p.is_absolute():
+        return str(p)
+    return str((_BASE_DIR / p).resolve())
+
+
+def rel_path(path_str: str) -> str:
+    """
+    Convert an absolute path into a path relative to BASE_DIR for portability.
+    If already relative, returns as-is.
+    """
+    if not path_str:
+        return path_str
+    p = Path(path_str)
+    if not p.is_absolute():
+        return path_str
+    try:
+        return str(p.resolve().relative_to(_BASE_DIR))
+    except Exception:
+        # If it can't be made relative, keep absolute (won't crash)
+        return str(p)
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    ensure_dirs()
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -67,10 +107,10 @@ def init_db() -> None:
             project_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             dataset_id INTEGER NOT NULL,
-            problem_type TEXT NOT NULL, -- classification/regression/clustering
+            problem_type TEXT NOT NULL,
             target_col TEXT DEFAULT '',
             metric TEXT NOT NULL,
-            algorithms_json TEXT NOT NULL, -- list[str]
+            algorithms_json TEXT NOT NULL,
             config_json TEXT DEFAULT '{}',
             created_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id),
@@ -85,7 +125,7 @@ def init_db() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             experiment_id INTEGER NOT NULL,
             algorithm TEXT NOT NULL,
-            status TEXT NOT NULL, -- CREATED/RUNNING/SUCCEEDED/FAILED
+            status TEXT NOT NULL,
             params_json TEXT DEFAULT '{}',
             metrics_json TEXT DEFAULT '{}',
             logs_text TEXT DEFAULT '',
@@ -104,7 +144,7 @@ def init_db() -> None:
             project_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             run_id INTEGER NOT NULL,
-            status TEXT NOT NULL, -- ACTIVE/STOPPED
+            status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY(project_id) REFERENCES projects(id),
             FOREIGN KEY(run_id) REFERENCES runs(id)
@@ -143,21 +183,20 @@ def list_projects() -> List[Dict[str, Any]]:
 # ---------------------------
 # Datasets
 # ---------------------------
-def _dataset_folder(project_id: int) -> str:
-    path = os.path.join(DATA_DIR, f"project_{project_id}")
-    os.makedirs(path, exist_ok=True)
+def _dataset_folder(project_id: int) -> Path:
+    path = _DATA_DIR_PATH / f"project_{project_id}"
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def save_dataset_csv(project_id: int, dataset_name: str, csv_bytes: bytes) -> Tuple[str, int]:
     """
     Saves uploaded CSV as a new dataset version.
-    Returns (file_path, version).
+    Returns (RELATIVE file_path, version).
     """
     conn = connect()
     cur = conn.cursor()
 
-    # version = max(version)+1 for this project+dataset_name
     row = cur.execute(
         """
         SELECT MAX(version) AS max_v
@@ -166,16 +205,16 @@ def save_dataset_csv(project_id: int, dataset_name: str, csv_bytes: bytes) -> Tu
         """,
         (project_id, dataset_name),
     ).fetchone()
+
     max_v = int(row["max_v"]) if row and row["max_v"] is not None else 0
     version = max_v + 1
 
     folder = _dataset_folder(project_id)
-    file_path = os.path.join(folder, f"{dataset_name}_v{version}.csv")
-    with open(file_path, "wb") as f:
-        f.write(csv_bytes)
+    file_path_abs = folder / f"{dataset_name}_v{version}.csv"
+    file_path_abs.write_bytes(csv_bytes)
 
     conn.close()
-    return file_path, version
+    return rel_path(str(file_path_abs)), version
 
 
 def create_dataset_record(
@@ -200,6 +239,14 @@ def create_dataset_record(
     return int(did)
 
 
+def delete_dataset(dataset_id: int) -> None:
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
+    conn.commit()
+    conn.close()
+
+
 def list_datasets(project_id: int) -> List[Dict[str, Any]]:
     conn = connect()
     cur = conn.cursor()
@@ -208,7 +255,8 @@ def list_datasets(project_id: int) -> List[Dict[str, Any]]:
         (project_id,),
     ).fetchall()
     conn.close()
-    out = []
+
+    out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
         try:
@@ -281,7 +329,8 @@ def list_experiments(project_id: int) -> List[Dict[str, Any]]:
         (project_id,),
     ).fetchall()
     conn.close()
-    out = []
+
+    out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
         d["algorithms"] = json.loads(d.get("algorithms_json") or "[]")
@@ -348,7 +397,7 @@ def update_run(
         vals.append(logs_text)
     if model_path is not None:
         fields.append("model_path = ?")
-        vals.append(model_path)
+        vals.append(rel_path(model_path))
 
     fields.append("updated_at = ?")
     vals.append(_now())
@@ -368,7 +417,7 @@ def list_runs(experiment_id: int) -> List[Dict[str, Any]]:
     ).fetchall()
     conn.close()
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
         d["params"] = json.loads(d.get("params_json") or "{}")
