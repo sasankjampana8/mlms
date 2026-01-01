@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+mlms_streamlit/data/
+mlms_streamlit/artifacts/
+*.db
+.venv/
+env/
+__pycache__/
